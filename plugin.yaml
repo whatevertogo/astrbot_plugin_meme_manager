@@ -2,7 +2,8 @@ name: astrbot_plugin_meme_manager
 display_name: Meme Manager
 desc: SDK migration of the legacy meme_manager plugin with command, LLM, sync, and HTTP overview support.
 author: anka
-version: 0.1.0
+repo: https://github.com/whatevertogo/astrbot_plugin_meme_manager
+version: 4.0
 runtime:
   python: "3.13"
 components:
