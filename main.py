@@ -701,7 +701,8 @@ class AstrbotPluginMemeManager(Star):
 
     async def _file_url_for_path(self, file_path: Path) -> str:
         ctx = self._require_ctx()
-        return await ctx.files.register_file_url(str(file_path), timeout=300)
+        token = await ctx.files.register_file(str(file_path), timeout=300)
+        return f"/api/file/{token}"
 
     async def _emoji_page_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         category = sanitize_category_name(
