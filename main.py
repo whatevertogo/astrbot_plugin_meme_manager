@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import base64
+import asyncio
 import json
-import mimetypes
 import random
 import re
 import tempfile
@@ -605,6 +604,29 @@ class AstrbotPluginMemeManager(Star):
             return str(value[0]).strip() if value else ""
         return str(value).strip() if value is not None else ""
 
+    @classmethod
+    def _http_int_value(
+        cls,
+        payload: dict[str, Any],
+        mapping_name: str,
+        key: str,
+        *,
+        default: int,
+        minimum: int = 0,
+        maximum: int | None = None,
+    ) -> int:
+        raw_value = cls._http_mapping_first_value(payload, mapping_name, key)
+        if not raw_value:
+            return default
+        try:
+            parsed = int(raw_value)
+        except ValueError:
+            return default
+        value = max(minimum, parsed)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
     @staticmethod
     def _json_response(
         body: dict[str, Any] | list[Any],
@@ -629,9 +651,6 @@ class AstrbotPluginMemeManager(Star):
             f"?category={quote(category)}&filename={quote(filename)}"
         )
 
-    def _preview_api_path(self, category: str, filename: str) -> str:
-        return f"/api/image?category={quote(category)}&filename={quote(filename)}"
-
     def _category_dir(self, category: str) -> Path:
         return self._require_paths().memes_dir / category
 
@@ -654,11 +673,93 @@ class AstrbotPluginMemeManager(Star):
                 {
                     "filename": filename,
                     "preview_url": self._preview_url(category, filename),
-                    "preview_api_path": self._preview_api_path(category, filename),
                 }
                 for filename in files
             ]
         return result
+
+    def _library_payload(self) -> dict[str, Any]:
+        files = list_category_files(self._require_paths().memes_dir)
+        descriptions = self._category_mapping()
+        categories: list[dict[str, Any]] = []
+        total_files = 0
+        for category in sorted(set(descriptions) | set(files)):
+            count = len(files.get(category, []))
+            total_files += count
+            categories.append(
+                {
+                    "category": category,
+                    "count": count,
+                    "description": descriptions.get(category, "请添加描述"),
+                }
+            )
+        return {
+            "descriptions": descriptions,
+            "categories": categories,
+            "total_files": total_files,
+        }
+
+    async def _file_url_for_path(self, file_path: Path) -> str:
+        ctx = self._require_ctx()
+        return await ctx.files.register_file_url(str(file_path), timeout=300)
+
+    async def _emoji_page_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        category = sanitize_category_name(
+            self._http_mapping_first_value(payload, "query", "category")
+        )
+        if not category:
+            raise AstrBotError.invalid_input("category query parameter is required")
+
+        offset = self._http_int_value(
+            payload,
+            "query",
+            "offset",
+            default=0,
+            minimum=0,
+        )
+        limit = self._http_int_value(
+            payload,
+            "query",
+            "limit",
+            default=24,
+            minimum=1,
+            maximum=48,
+        )
+        files = list_category_files(self._require_paths().memes_dir)
+        filenames = files.get(category, [])
+        page_filenames = filenames[offset : offset + limit]
+        file_paths = [
+            self._resolve_image_path(category, filename) for filename in page_filenames
+        ]
+        preview_urls = await asyncio.gather(
+            *[
+                self._file_url_for_path(file_path)
+                for file_path in file_paths
+                if file_path is not None
+            ]
+        )
+        items: list[dict[str, str]] = []
+        url_index = 0
+        for filename, file_path in zip(page_filenames, file_paths, strict=False):
+            if file_path is None:
+                continue
+            items.append(
+                {
+                    "filename": filename,
+                    "preview_url": preview_urls[url_index],
+                }
+            )
+            url_index += 1
+        next_offset = offset + len(items)
+        return {
+            "category": category,
+            "total": len(filenames),
+            "offset": offset,
+            "limit": limit,
+            "next_offset": next_offset,
+            "has_more": next_offset < len(filenames),
+            "items": items,
+        }
 
     def _sync_config_payload(self) -> dict[str, Any]:
         missing_in_config, deleted_categories = (
@@ -930,8 +1031,15 @@ class AstrbotPluginMemeManager(Star):
   </div>
   <script>
     const API_BASE = "__API_BASE__";
-    const PAGE_BASE = "__PAGE_BASE__";
-    const state = { categories: {}, descriptions: {}, sync: null, cloud: null, polling: null };
+    const state = {
+      categories: [],
+      descriptions: {},
+      itemsByCategory: {},
+      pageInfo: {},
+      sync: null,
+      cloud: null,
+      polling: null,
+    };
 
     function authHeaders(extra = {}) {
       const token = window.localStorage.getItem("token");
@@ -968,45 +1076,25 @@ class AstrbotPluginMemeManager(Star):
       document.getElementById("notice").style.display = "none";
     }
 
-    async function loadPreviewImage(img) {
-      const previewPath = img.dataset.previewApi;
-      if (!previewPath || img.dataset.loaded === "1") return;
-      img.dataset.loaded = "loading";
-      try {
-        const payload = await api(previewPath);
-        if (!payload?.data_base64 || !payload?.content_type) {
-          throw new Error("预览数据为空");
-        }
-        img.src = `data:${payload.content_type};base64,${payload.data_base64}`;
-        img.dataset.loaded = "1";
-      } catch (error) {
-        img.dataset.loaded = "error";
-        img.alt = `加载失败: ${error.message}`;
-      }
-    }
-
-    function hydratePreviewImages() {
-      const images = document.querySelectorAll("img[data-preview-api]");
-      for (const img of images) {
-        void loadPreviewImage(img);
-      }
-    }
-
     async function refreshAll() {
       try {
         hideNotice();
-        const [emojiData, descriptions, configStatus, cloudStatus] = await Promise.all([
-          api("/api/emoji"),
-          api("/api/emotions"),
+        const [library, configStatus, cloudStatus] = await Promise.all([
+          api("/api/library"),
           api("/api/sync/status"),
           api("/api/img_host/sync/status").catch((error) => ({ error: error.message })),
         ]);
-        state.categories = emojiData;
-        state.descriptions = descriptions;
+        state.categories = library.categories || [];
+        state.descriptions = library.descriptions || {};
+        state.itemsByCategory = {};
+        state.pageInfo = {};
         state.sync = configStatus;
         state.cloud = cloudStatus;
         renderSummary();
         renderCategories();
+        if (state.categories.length) {
+          void loadCategoryPage(state.categories[0].category, { reset: true });
+        }
       } catch (error) {
         showNotice(`加载失败：${error.message}`, true);
       }
@@ -1014,8 +1102,8 @@ class AstrbotPluginMemeManager(Star):
 
     function renderSummary() {
       const summaryBox = document.getElementById("summary-box");
-      const categoryCount = Object.keys(state.categories || {}).length;
-      const totalFiles = Object.values(state.categories || {}).reduce((count, items) => count + items.length, 0);
+      const categoryCount = state.categories.length;
+      const totalFiles = state.categories.reduce((count, item) => count + (item.count || 0), 0);
       const sync = state.sync?.differences || {};
       const cloud = state.cloud || {};
       summaryBox.innerHTML = `
@@ -1030,20 +1118,23 @@ class AstrbotPluginMemeManager(Star):
 
     function renderCategories() {
       const container = document.getElementById("category-list");
-      const categories = Object.entries(state.categories || {});
-      if (!categories.length) {
+      if (!state.categories.length) {
         container.innerHTML = '<div class="empty-state">当前还没有任何表情分类。</div>';
         return;
       }
       container.innerHTML = "";
-      for (const [category, items] of categories) {
+      for (const item of state.categories) {
+        const category = item.category;
+        const items = state.itemsByCategory[category] || [];
+        const pageInfo = state.pageInfo[category] || { has_more: (item.count || 0) > 0, loading: false };
         const card = document.createElement("section");
         card.className = "category-card";
-        const description = state.descriptions?.[category] || "请添加描述";
+        const description = item.description || state.descriptions?.[category] || "请添加描述";
         card.innerHTML = `
           <div class="category-header">
             <div>
               <h3>${category}</h3>
+              <p style="margin-bottom:8px;color:#172033;font-weight:600;">共 ${item.count || 0} 张</p>
               <p>${description}</p>
             </div>
             <div class="category-toolbar">
@@ -1083,14 +1174,53 @@ class AstrbotPluginMemeManager(Star):
               <button class="button button-danger" data-action="delete-image" data-category="${category}" data-filename="${item.filename}">删除图片</button>
             </div>
           `;
-          const img = emoji.querySelector("img");
-          img.removeAttribute("src");
-          img.dataset.previewApi = item.preview_api_path || "";
           grid.appendChild(emoji);
+        }
+
+        if (!items.length) {
+          const placeholder = document.createElement("div");
+          placeholder.className = "empty-state";
+          placeholder.textContent = pageInfo.loading ? "正在加载图片..." : "尚未加载该分类图片。";
+          grid.appendChild(placeholder);
+        }
+
+        if ((item.count || 0) > 0) {
+          const more = document.createElement("button");
+          more.className = "button button-soft";
+          more.dataset.action = "load-more";
+          more.dataset.category = category;
+          more.textContent = pageInfo.loading
+            ? "加载中..."
+            : items.length
+              ? (pageInfo.has_more ? "加载更多" : "已加载完毕")
+              : "加载图片";
+          more.disabled = !!pageInfo.loading || !pageInfo.has_more && items.length > 0;
+          card.appendChild(more);
         }
         container.appendChild(card);
       }
-      hydratePreviewImages();
+    }
+
+    async function loadCategoryPage(category, { reset = false } = {}) {
+      const current = state.pageInfo[category] || { next_offset: 0, has_more: true };
+      if (current.loading) return;
+      const offset = reset ? 0 : (current.next_offset || 0);
+      state.pageInfo[category] = { ...current, loading: true };
+      renderCategories();
+      try {
+        const payload = await api(`/api/emoji?category=${encodeURIComponent(category)}&offset=${offset}&limit=24`);
+        const existing = reset ? [] : (state.itemsByCategory[category] || []);
+        state.itemsByCategory[category] = existing.concat(payload.items || []);
+        state.pageInfo[category] = {
+          next_offset: payload.next_offset || state.itemsByCategory[category].length,
+          has_more: !!payload.has_more,
+          loading: false,
+        };
+      } catch (error) {
+        state.pageInfo[category] = { ...current, loading: false };
+        showNotice(`加载 ${category} 失败：${error.message}`, true);
+      }
+      renderCategories();
     }
 
     async function uploadFiles(category, fileList) {
@@ -1182,6 +1312,9 @@ class AstrbotPluginMemeManager(Star):
           await mutate("/api/category/rename", { old_name: category, new_name: value }, `已重命名 ${category} -> ${value}`);
         }
       }
+      if (action === "load-more" && category) {
+        await loadCategoryPage(category);
+      }
     });
 
     document.getElementById("refresh-btn").addEventListener("click", refreshAll);
@@ -1212,9 +1345,7 @@ class AstrbotPluginMemeManager(Star):
   </script>
 </body>
 </html>"""
-        return html.replace("__API_BASE__", self._plugin_api_base()).replace(
-            "__PAGE_BASE__", self._plugin_public_base()
-        )
+        return html.replace("__API_BASE__", self._plugin_api_base())
 
     def _merge_components_with_images(
         self,
@@ -1708,24 +1839,24 @@ class AstrbotPluginMemeManager(Star):
         image_path = self._resolve_image_path(category, filename)
         if image_path is None:
             return self._error_response("图片不存在", status=404)
-        content_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
+        file_url = await self._file_url_for_path(image_path)
         return {
-            "status": 200,
+            "status": 302,
             "headers": {
-                "Content-Type": content_type,
-                "Cache-Control": "public, max-age=300",
+                "Location": file_url,
+                "Cache-Control": "no-store",
             },
-            "body": image_path.read_bytes(),
+            "body": "",
         }
 
     @http_api(
         "/astrbot_plugin_meme_manager/api/image",
         methods=["GET"],
-        description="Return a base64 encoded meme preview image",
+        description="Return a public file URL for a meme preview image",
     )
     @provide_capability(
         name="astrbot_plugin_meme_manager.image_data",
-        description="Return a base64 encoded preview image for the management page",
+        description="Return a public file URL for the management page preview image",
     )
     async def http_image_data(self, payload: dict[str, Any]) -> dict[str, Any]:
         category = self._http_mapping_first_value(payload, "query", "category")
@@ -1733,15 +1864,12 @@ class AstrbotPluginMemeManager(Star):
         image_path = self._resolve_image_path(category, filename)
         if image_path is None:
             return self._error_response("图片不存在", status=404)
-        content_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
+        file_url = await self._file_url_for_path(image_path)
         return self._json_response(
             {
                 "category": category,
                 "filename": filename,
-                "content_type": content_type,
-                "data_base64": base64.b64encode(image_path.read_bytes()).decode(
-                    "ascii"
-                ),
+                "url": file_url,
             }
         )
 
@@ -1756,12 +1884,7 @@ class AstrbotPluginMemeManager(Star):
     )
     async def http_library(self, payload: dict[str, Any]) -> dict[str, Any]:
         del payload
-        return self._json_response(
-            {
-                "descriptions": self._category_mapping(),
-                "files": list_category_files(self._require_paths().memes_dir),
-            }
-        )
+        return self._json_response(self._library_payload())
 
     @http_api(
         "/astrbot_plugin_meme_manager/api/emoji",
@@ -1773,8 +1896,7 @@ class AstrbotPluginMemeManager(Star):
         description="Return grouped meme files with preview URLs",
     )
     async def http_emoji(self, payload: dict[str, Any]) -> dict[str, Any]:
-        del payload
-        return self._json_response(self._scan_emoji_payload())
+        return self._json_response(await self._emoji_page_payload(payload))
 
     @http_api(
         "/astrbot_plugin_meme_manager/api/emotions",

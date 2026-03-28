@@ -173,7 +173,7 @@ async def test_streaming_finish_defers_images_instead_of_merging() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_library_returns_descriptions_and_files() -> None:
+async def test_http_library_returns_summary_payload() -> None:
     plugin = AstrbotPluginMemeManager()
     ctx = MockContext(
         plugin_id="astrbot_plugin_meme_manager",
@@ -185,7 +185,8 @@ async def test_http_library_returns_descriptions_and_files() -> None:
 
     assert response["status"] == 200
     assert "descriptions" in response["body"]
-    assert "files" in response["body"]
+    assert "categories" in response["body"]
+    assert "total_files" in response["body"]
 
 
 @pytest.mark.asyncio
@@ -253,7 +254,7 @@ async def test_http_add_and_delete_emoji_routes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_image_data_returns_base64_payload() -> None:
+async def test_http_emoji_returns_paginated_preview_urls() -> None:
     plugin = AstrbotPluginMemeManager()
     ctx = MockContext(
         plugin_id="astrbot_plugin_meme_manager",
@@ -263,15 +264,15 @@ async def test_http_image_data_returns_base64_payload() -> None:
 
     data_dir = await ctx.get_data_dir()
     category, files = next(iter(list_category_files(data_dir / "memes").items()))
-    filename = files[0]
-
-    response = await plugin.http_image_data(
-        {"query": {"category": [category], "filename": [filename]}}
+    response = await plugin.http_emoji(
+        {"query": {"category": [category], "offset": ["0"], "limit": ["5"]}}
     )
 
     assert response["status"] == 200
-    assert response["body"]["content_type"].startswith("image/")
-    assert response["body"]["data_base64"]
+    assert response["body"]["category"] == category
+    assert response["body"]["items"]
+    assert len(response["body"]["items"]) <= 5
+    assert response["body"]["items"][0]["preview_url"]
 
 
 @pytest.mark.asyncio
