@@ -9,17 +9,17 @@ What is migrated:
 - LLM prompt injection and response tag extraction
 - result decoration plus deferred image sending
 - optional remote image-host sync
-- SDK HTTP overview and JSON endpoints
+- SDK HTTP management page, uploads, previews, and JSON endpoints
 
 What is intentionally not migrated 1:1:
 
 - the legacy standalone Quart/Hypercorn WebUI process
-- multipart upload and static-file serving from the old backend
 
 The SDK version keeps the data model and command workflow, but exposes:
 
-- a public overview page at `/plug/{plugin_id}`
-- JSON APIs at `/api/plug/{plugin_id}` and `/api/plug/{plugin_id}/api/*`
+- a public management page at `/plug/{plugin_id}`
+- protected JSON APIs at `/api/plug/{plugin_id}` and `/api/plug/{plugin_id}/api/*`
+- public image previews at `/plug/{plugin_id}/image?category=...&filename=...`
 
 instead of booting its own server.
 

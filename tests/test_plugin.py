@@ -4,13 +4,14 @@ import time
 from pathlib import Path
 
 import pytest
-from PIL import Image as PILImage
-
 from astrbot_sdk import EventResultType, Image, MessageChain, MessageEventResult, Plain
 from astrbot_sdk.clients.llm import LLMResponse
 from astrbot_sdk.llm.entities import ProviderRequest
 from astrbot_sdk.message import payload_to_component
 from astrbot_sdk.testing import MockContext, MockMessageEvent, PluginHarness
+from PIL import Image as PILImage
+from services import list_category_files
+
 from main import (
     FOUND_EMOTIONS_KEY,
     PENDING_IMAGES_KEY,
@@ -185,6 +186,126 @@ async def test_http_library_returns_descriptions_and_files() -> None:
     assert response["status"] == 200
     assert "descriptions" in response["body"]
     assert "files" in response["body"]
+
+
+@pytest.mark.asyncio
+async def test_http_overview_returns_management_page() -> None:
+    plugin = AstrbotPluginMemeManager()
+    ctx = MockContext(
+        plugin_id="astrbot_plugin_meme_manager",
+        plugin_metadata={"display_name": "Meme Manager"},
+    )
+    await plugin.on_start(ctx)
+
+    response = await plugin.overview({})
+
+    assert response["status"] == 200
+    assert response["headers"]["Content-Type"].startswith("text/html")
+    assert "刷新图库" in response["body"]
+    assert "/api/emoji" in response["body"]
+
+
+@pytest.mark.asyncio
+async def test_http_add_and_delete_emoji_routes(tmp_path: Path) -> None:
+    plugin = AstrbotPluginMemeManager()
+    ctx = MockContext(
+        plugin_id="astrbot_plugin_meme_manager",
+        plugin_metadata={"display_name": "Meme Manager"},
+    )
+    await plugin.on_start(ctx)
+
+    upload_file = create_test_image(tmp_path / "sdk-upload.png")
+    add_response = await plugin.http_add_emoji(
+        {
+            "form": {"category": ["sdk-http-upload"]},
+            "files": [
+                {
+                    "field_name": "image_file",
+                    "filename": "sdk-upload.png",
+                    "content_type": "image/png",
+                    "path": str(upload_file),
+                    "size": upload_file.stat().st_size,
+                }
+            ],
+        }
+    )
+
+    assert add_response["status"] == 201
+    assert add_response["body"]["category"] == "sdk-http-upload"
+    saved_name = add_response["body"]["saved_files"][0]
+    assert not upload_file.exists()
+
+    data_dir = await ctx.get_data_dir()
+    image_path = data_dir / "memes" / "sdk-http-upload" / saved_name
+    assert image_path.exists()
+
+    delete_response = await plugin.http_delete_emoji(
+        {
+            "json_body": {
+                "category": "sdk-http-upload",
+                "image_file": saved_name,
+            }
+        }
+    )
+
+    assert delete_response["status"] == 200
+    assert not image_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_http_image_data_returns_base64_payload() -> None:
+    plugin = AstrbotPluginMemeManager()
+    ctx = MockContext(
+        plugin_id="astrbot_plugin_meme_manager",
+        plugin_metadata={"display_name": "Meme Manager"},
+    )
+    await plugin.on_start(ctx)
+
+    data_dir = await ctx.get_data_dir()
+    category, files = next(iter(list_category_files(data_dir / "memes").items()))
+    filename = files[0]
+
+    response = await plugin.http_image_data(
+        {"query": {"category": [category], "filename": [filename]}}
+    )
+
+    assert response["status"] == 200
+    assert response["body"]["content_type"].startswith("image/")
+    assert response["body"]["data_base64"]
+
+
+@pytest.mark.asyncio
+async def test_http_category_mutations_cover_management_routes() -> None:
+    plugin = AstrbotPluginMemeManager()
+    ctx = MockContext(
+        plugin_id="astrbot_plugin_meme_manager",
+        plugin_metadata={"display_name": "Meme Manager"},
+    )
+    await plugin.on_start(ctx)
+
+    restore_response = await plugin.http_restore_category(
+        {"json_body": {"category": "sdk-http-cat", "description": "初始描述"}}
+    )
+    assert restore_response["status"] == 200
+    assert "sdk-http-cat" in plugin._category_mapping()
+
+    update_response = await plugin.http_update_category_description(
+        {"json_body": {"tag": "sdk-http-cat", "description": "更新描述"}}
+    )
+    assert update_response["status"] == 200
+    assert plugin._category_mapping()["sdk-http-cat"] == "更新描述"
+
+    rename_response = await plugin.http_rename_category(
+        {"json_body": {"old_name": "sdk-http-cat", "new_name": "sdk-http-cat-2"}}
+    )
+    assert rename_response["status"] == 200
+    assert "sdk-http-cat-2" in plugin._category_mapping()
+
+    delete_response = await plugin.http_delete_category(
+        {"json_body": {"category": "sdk-http-cat-2"}}
+    )
+    assert delete_response["status"] == 200
+    assert "sdk-http-cat-2" not in plugin._category_mapping()
 
 
 @pytest.mark.asyncio
